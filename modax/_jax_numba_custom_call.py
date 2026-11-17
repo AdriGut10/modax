@@ -35,7 +35,7 @@ ABI_SCALAR_I32 = 2
 
 @dataclass(frozen=True)
 class CudaLaunch:
-    """A compiled kernel's ``CUfunction`` pointer and launch geometry."""
+    """A compiled kernel's context-independent ``CUkernel`` handle and launch geometry."""
 
     function: int
     grid: tuple[int, int, int]
@@ -272,10 +272,10 @@ def register_target() -> ctypes.CDLL:
     return lib
 
 
-# Loaded modules are held for the process lifetime: the ``CUfunction`` handed to
-# the FFI target stays valid only while its module is loaded, and these kernels
+# Loaded libraries are held for the process lifetime: the ``CUkernel`` handed to
+# the FFI target stays valid only while its library is loaded, and these kernels
 # live as long as the JAX primitives that launch them.
-_LOADED_MODULES: list[ctypes.c_void_p] = []
+_LOADED_LIBRARIES: list[ctypes.c_void_p] = []
 
 
 _ENZYME_CC_ENV_VAR = "NUMBA_ENZYME_CUDA_CC"
@@ -333,16 +333,23 @@ def target_kernel(kernel: MLIRDispatcher) -> MLIRDispatcher:
 
 
 def compile_kernel(kernel: MLIRDispatcher, argtypes: Sequence[Type]) -> int:
-    """Compile a ``cuda.jit`` kernel and return its ``CUfunction`` pointer.
+    """Compile a ``cuda.jit`` kernel and return its ``CUkernel`` handle.
 
     Compiles for `compile_target`, which differs from the GPU only on
     Blackwell. numba-cuda-mlir has no ``get_cufunc()``, so this loads the
     cubin from the compile result's metadata through the driver and looks the
     entry point up by its mangled name.
 
+    The handle is context-independent (CUDA 12.0+ library management): the
+    kernel is loaded into whichever context launches it, and ``cuLaunchKernel``
+    takes that context from XLA's stream. A ``CUfunction`` from
+    ``cuModuleLoadData`` belongs to the context current at compile time, so one
+    process driving several GPUs failed on all but one of them with
+    ``CUDA_ERROR_INVALID_HANDLE`` (400).
+
     Raises:
-        RuntimeError: If the driver fails to load the module or find the
-            function.
+        RuntimeError: If the driver fails to load the library or find the
+            kernel.
     """
 
     cres = target_kernel(kernel).compile(tuple(argtypes)).cres
@@ -350,21 +357,21 @@ def compile_kernel(kernel: MLIRDispatcher, argtypes: Sequence[Type]) -> int:
     func_name = cres.metadata["func_name"]
 
     libcuda = ctypes.CDLL("libcuda.so.1")
-    module = ctypes.c_void_p()
-    err = libcuda.cuModuleLoadData(ctypes.byref(module), ctypes.c_char_p(cubin))
-    if err != 0:
-        raise RuntimeError(f"cuModuleLoadData failed with CUDA driver error {err}")
-    _LOADED_MODULES.append(module)
-
-    function = ctypes.c_void_p()
-    err = libcuda.cuModuleGetFunction(
-        ctypes.byref(function), module, func_name.encode()
+    library = ctypes.c_void_p()
+    err = libcuda.cuLibraryLoadData(
+        ctypes.byref(library), ctypes.c_char_p(cubin), None, None, 0, None, None, 0
     )
     if err != 0:
-        raise RuntimeError(f"cuModuleGetFunction failed with CUDA driver error {err}")
-    if function.value is None:
-        raise RuntimeError("cuModuleGetFunction returned a null function pointer")
-    return int(function.value)
+        raise RuntimeError(f"cuLibraryLoadData failed with CUDA driver error {err}")
+    _LOADED_LIBRARIES.append(library)
+
+    handle = ctypes.c_void_p()
+    err = libcuda.cuLibraryGetKernel(ctypes.byref(handle), library, func_name.encode())
+    if err != 0:
+        raise RuntimeError(f"cuLibraryGetKernel failed with CUDA driver error {err}")
+    if handle.value is None:
+        raise RuntimeError("cuLibraryGetKernel returned a null kernel handle")
+    return int(handle.value)
 
 
 def make_launch(
